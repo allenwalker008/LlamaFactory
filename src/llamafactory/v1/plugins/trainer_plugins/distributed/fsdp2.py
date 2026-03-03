@@ -230,17 +230,16 @@ class FSDP2Engine:
         
         with torch.no_grad():
             for param in model.parameters():
-                if self.rank == 0 and param.device.type != device.type:
-                    # Move Rank 0's CPU tensor to accelerator device for NCCL broadcast
+                if param.device.type != device.type:
+                    # Move to accelerator device for NCCL/HCCL broadcast
                     temp_tensor = param.to(device)
                     dist.broadcast(temp_tensor, src=0, group=self.fsdp_mesh.get_group())
-                    # Optionally copy back or just let FSDP handle it
                     param.copy_(temp_tensor.to("cpu"))
                 else:
                     dist.broadcast(param, src=0, group=self.fsdp_mesh.get_group())
                     
             for buffer in model.buffers():
-                if self.rank == 0 and buffer.device.type != device.type:
+                if buffer.device.type != device.type:
                     temp_buffer = buffer.to(device)
                     dist.broadcast(temp_buffer, src=0, group=self.fsdp_mesh.get_group())
                     buffer.copy_(temp_buffer.to("cpu"))
