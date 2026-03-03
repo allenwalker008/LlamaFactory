@@ -212,8 +212,49 @@ class FSDP2Engine:
 
         return model
 
+    def _sync_module_states(self, model: HFModel):
+        """Broadcasts model parameters and buffers from rank 0 to all other ranks.
+        This is necessary for the `init_on_rank0` strategy where Rank 0 is instantiated
+        on CPU while other ranks are instantiated on Meta device.
+        """
+        import torch.distributed as dist
+        
+        if self.rank == 0:
+            logger.info("Broadcasting model parameters from Rank 0 to all ranks...")
+            
+        device = get_current_accelerator()
+        
+        # Rank > 0 has Meta tensors, we need to convert them to real tensors before broadcasting
+        if self.rank != 0 and any(p.device.type == "meta" for p in model.parameters()):
+            model.to_empty(device=device)
+        
+        with torch.no_grad():
+            for param in model.parameters():
+                if self.rank == 0 and param.device.type != device.type:
+                    # Move Rank 0's CPU tensor to accelerator device for NCCL broadcast
+                    temp_tensor = param.to(device)
+                    dist.broadcast(temp_tensor, src=0, group=self.fsdp_mesh.get_group())
+                    # Optionally copy back or just let FSDP handle it
+                    param.copy_(temp_tensor.to("cpu"))
+                else:
+                    dist.broadcast(param, src=0, group=self.fsdp_mesh.get_group())
+                    
+            for buffer in model.buffers():
+                if self.rank == 0 and buffer.device.type != device.type:
+                    temp_buffer = buffer.to(device)
+                    dist.broadcast(temp_buffer, src=0, group=self.fsdp_mesh.get_group())
+                    buffer.copy_(temp_buffer.to("cpu"))
+                else:
+                    dist.broadcast(buffer, src=0, group=self.fsdp_mesh.get_group())
+
     def shard_model(self, model: HFModel) -> HFModel:
-        if model.device.type == "meta":
+        # Check if Rank 0 has CPU weights but other ranks have Meta weights (`init_on_rank0` strategy)
+        has_meta = any(p.device.type == "meta" for p in model.parameters())
+        if has_meta and self.rank == 0 and not any(p.device.type == "meta" for p in model.parameters()):
+            # This is the init_on_rank0 state: Rank 0 has real weights, others have meta weights.
+            model = self.prepare_model(model)
+            self._sync_module_states(model)
+        elif model.device.type == "meta":
             model = self.prepare_model(model)
             model = self.materialize_and_load(model, hf_model_path=model.config.name_or_path, dcp_path=self.dcp_path)
         else:
