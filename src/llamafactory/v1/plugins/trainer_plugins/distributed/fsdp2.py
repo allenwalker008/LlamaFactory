@@ -75,7 +75,6 @@ class FSDP2Engine:
         self.offload_params = dist_config.get("offload_params", False)
         self.pin_memory = dist_config.get("pin_memory", True)
         self.dcp_path = dist_config.get("dcp_path", None)
-        self.init_device = dist_config.get("init_device", "init_on_meta")  # e.g. "init_on_rank0" or "init_on_meta"
         self.device_mesh = self.dist_interface.data_device_mesh
 
         if self.device_mesh is None:
@@ -235,12 +234,17 @@ class FSDP2Engine:
             logger.info("State dict scatter complete.")
 
     def shard_model(self, model: HFModel) -> HFModel:
-        # Detect init_on_rank0: Rank 0 loaded real weights on CPU, Rank 1+ have meta empty shells.
-        # We use the stored init_device so every rank independently knows what strategy was chosen
-        # (we can't compare device states across ranks in a single-process context).
-        if self.init_device == "init_on_rank0":
+        import torch.distributed as dist
+
+        # Detect init_on_rank0 purely from runtime state:
+        # Rank 0 broadcasts whether its own params are on CPU (not Meta).
+        # If yes, all Rank 1+ must have Meta shells → this is the init_on_rank0 scenario.
+        rank0_is_cpu = [not any(p.device.type == "meta" for p in model.parameters()) and any(p.device.type == "cpu" for p in model.parameters())]
+        dist.broadcast_object_list(rank0_is_cpu, src=0, group=self.fsdp_mesh.get_group())
+
+        if rank0_is_cpu[0]:
             if self.rank == 0:
-                logger.info("init_on_rank0 detected: preparing model for sharding then scattering weights.")
+                logger.info("init_on_rank0 detected: sharding then scattering Rank 0 CPU weights.")
             model = self.prepare_model(model)
             self._sync_module_states(model)
         elif model.device.type == "meta":
