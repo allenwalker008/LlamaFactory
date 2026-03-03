@@ -212,6 +212,38 @@ class FSDP2Engine:
 
         return model
 
+    def _save_non_persistent_buffers(self, model: HFModel) -> dict:
+        """Save persistent=False buffers such as inv_freq before they get erased by to_empty()."""
+        import copy
+
+        saved = {}
+        for mod_name, module in model.named_modules():
+            for buf_name in module._non_persistent_buffers_set:
+                fqn = f"{mod_name}.{buf_name}" if mod_name else buf_name
+                buf = getattr(module, buf_name, None)
+                if buf is not None:
+                    saved[fqn] = copy.deepcopy(buf)
+        if self.rank == 0 and saved:
+            logger.info(f"Saved {len(saved)} non-persistent buffers")
+        return saved
+
+    def _restore_non_persistent_buffers(self, model: HFModel, saved_buffers: dict):
+        """Re-register saved non-persistent buffers on the model after to_empty() wipes them."""
+        if not saved_buffers:
+            return
+        device = get_current_accelerator()
+        for fqn, buf in saved_buffers.items():
+            buf = buf.to(device)
+            if "." in fqn:
+                parent_fqn, buf_name = fqn.rsplit(".", 1)
+                parent_module = model.get_submodule(parent_fqn)
+            else:
+                buf_name = fqn
+                parent_module = model
+            parent_module.register_buffer(buf_name, buf, persistent=False)
+        if self.rank == 0:
+            logger.info(f"Restored {len(saved_buffers)} non-persistent buffers")
+
     def shard_model(self, model: HFModel) -> HFModel:
         import torch.distributed as dist
         from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
