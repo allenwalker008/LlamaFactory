@@ -225,26 +225,46 @@ class FSDP2Engine:
         if rank0_is_cpu[0]:
             if self.rank == 0:
                 logger.info("init_on_rank0 detected: sharding then scattering Rank 0 CPU weights.")
-                # Capture the full state dict BEFORE fully_shard converts params to DTensors.
-                # model.state_dict() on a plain CPU nn.Module is a simple dict, no collective ops needed.
                 full_sd = {k: v.clone() for k, v in model.state_dict().items()}
             else:
                 full_sd = {}
 
+            # Reuse existing helper to save persistent=False buffers (e.g. inv_freq) before shard
+            saved_buffers = self._save_non_persistent_buffers(model) if self.rank == 0 else {}
+
             model = self.prepare_model(model)
 
-            # Materialize all params to empty device tensors (Rank 1+ Meta → empty device)
             device = get_current_accelerator()
             model.to_empty(device=device)
 
-            # Scatter: Rank 0 broadcasts each tensor from full_sd into everyone's DTensor shards.
-            # broadcast_from_rank0=True handles the Rank0→all distribution without AllGather.
+            # Scatter params from Rank 0 into all DTensor shards
             options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
             set_model_state_dict(model, full_sd, options=options)
 
+            # Reuse existing helper to restore inv_freq etc. on Rank 0, then broadcast to Rank 1+
+            self._restore_non_persistent_buffers(model, saved_buffers)
+            for _, buf in model.named_buffers():
+                if buf is not None:
+                    dist.broadcast(buf.data, src=0, group=self.fsdp_mesh.get_group())
+
+            if self.rank == 0:
+                logger.info("init_on_rank0 sync complete.")
+
         elif model.device.type == "meta":
+            non_persistent_buffers = self._save_non_persistent_buffers(model)
+
+            if getattr(model.config, "tie_word_embeddings", None):
+                model.tie_weights()
+
             model = self.prepare_model(model)
             model = self.materialize_and_load(model, hf_model_path=model.config.name_or_path, dcp_path=self.dcp_path)
+
+            # fix tied broken for no-fsdp-wrap case
+            if getattr(model.config, "tie_word_embeddings", None):
+                model.tie_weights()
+
+            self._restore_non_persistent_buffers(model, non_persistent_buffers)
+
         else:
             model = self.prepare_model(model)
         return model
