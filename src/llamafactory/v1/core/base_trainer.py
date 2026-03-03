@@ -124,6 +124,11 @@ class BaseTrainer:
         else:
             from ..plugins.trainer_plugins.distributed.hub import DistributedPlugin
 
+            # Inject the init_device strategy name so distributed engines (e.g. FSDP2) can
+            # determine how the model was initialized without per-rank devicetype detection.
+            if self.args.init_config is not None:
+                self.args.dist_config["init_device"] = self.args.init_config.name
+
             self.model = DistributedPlugin(self.args.dist_config.name)(
                 self.model,
                 self.args.dist_config,

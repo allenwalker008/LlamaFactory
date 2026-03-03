@@ -75,6 +75,7 @@ class FSDP2Engine:
         self.offload_params = dist_config.get("offload_params", False)
         self.pin_memory = dist_config.get("pin_memory", True)
         self.dcp_path = dist_config.get("dcp_path", None)
+        self.init_device = dist_config.get("init_device", "init_on_meta")  # e.g. "init_on_rank0" or "init_on_meta"
         self.device_mesh = self.dist_interface.data_device_mesh
 
         if self.device_mesh is None:
@@ -213,63 +214,33 @@ class FSDP2Engine:
         return model
 
     def _sync_module_states(self, model: HFModel):
-        """Broadcasts model parameters and buffers from rank 0 to all other ranks.
-        This is safely executed AFTER FSDP sharding so that we broadcast chunk-by-chunk
-        to avoid Out-Of-Memory errors on Rank > 0's device.
+        """After `prepare_model`, broadcast Rank 0's full weights to all shards using PyTorch DCP APIs.
+        `get_model_state_dict(full_state_dict=True)` gathers from all ranks to Rank 0 CPU, then
+        `set_model_state_dict(full_state_dict=True)` scatters them back into local DTensor shards on each rank.
+        This avoids storing the full model twice on Rank 1+ devices.
         """
-        import torch.distributed as dist
-        from torch.distributed.checkpoint.state_dict import set_model_state_dict, get_model_state_dict, StateDictOptions
-        
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict, StateDictOptions
+
         if self.rank == 0:
-            logger.info("Broadcasting model parameters from Rank 0 to locally sharded tensors via State Dict...")
-            
-        device = get_current_accelerator()
-        
-        # We extract the full state dict from Rank 0 (which has the CPU weights).
-        # Rank 0 is holding the un-sharded weights locally in its state_dict before FSDP destroys them or partitions them.
-        # Actually, because we call this AFTER prepare_model (fully_shard), Rank 0's parameters are already DTensors.
-        # So we must get the full state dict using PyTorch DCP's CPU offload to gather from Rank 0.
-        
+            logger.info("Scattering Rank 0 weights into FSDP2 local shards via state dict...")
+
         options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        # 1. Gather the full physical weights on Rank 0
+        # Gather full state dict from Rank 0 (the only rank that actually has real data at this point)
         full_state_dict = get_model_state_dict(model, options=options)
-        
-        # 2. Iterate through the keys and broadcast them one by one to avoid memory peaks
-        with torch.no_grad():
-            for key, tensor in full_state_dict.items():
-                if self.rank != 0:
-                    # Allocate temporary buffer on CPU on other ranks to receive the tensor
-                    # The shape and dtype must be identical to Rank 0's.
-                    # We can use dist.broadcast_object_list or just a shape broadcast first.
-                    pass
-                
-                # In modern FSDP2, `set_model_state_dict` natively handles scattering a full state
-                # dict on Rank 0 directly to the distributed shards on all ranks efficiently!
-                pass
-                
-        # Actually, the cleanest and most native way in PyTorch FSDP2 is to simply call `set_model_state_dict`
-        # Because FSDP2 overrides the state_dict setter to perform the exact Scatter operation we want.
-        # If Rank 0 has the full dict, and everyone else has an empty dict or the same dict, it scatters properly.
-        # However, to avoid memory spikes, we let Rank 0 hold the `full_state_dict` and Rank 1+ hold an empty dict.
-        
-        if self.rank != 0:
-            full_state_dict = {}
-        
-        # `set_model_state_dict` naturally supports distributing a dict from rank 0
-        # Wait, `set_model_state_dict` expects the dict to contain the appropriate shapes for the local rank 
-        # OR it needs `full_state_dict=True` to scatter.
-        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        try:
-            set_model_state_dict(model, full_state_dict, options=options)
-        except Exception as e:
-            logger.error(f"Failed to scatter state dict: {e}")
-            raise e
+        # Scatter: set_model_state_dict with full_state_dict will automatically distribute
+        # the tensors into the local DTensor shards of each participating rank
+        set_model_state_dict(model, full_state_dict, options=options)
+
+        if self.rank == 0:
+            logger.info("State dict scatter complete.")
 
     def shard_model(self, model: HFModel) -> HFModel:
-        # Check if Rank 0 has CPU weights but other ranks have Meta weights (`init_on_rank0` strategy)
-        has_meta = any(p.device.type == "meta" for p in model.parameters())
-        if has_meta and self.rank == 0 and not any(p.device.type == "meta" for p in model.parameters()):
-            # This is the init_on_rank0 state: Rank 0 has real weights, others have meta weights.
+        # Detect init_on_rank0: Rank 0 loaded real weights on CPU, Rank 1+ have meta empty shells.
+        # We use the stored init_device so every rank independently knows what strategy was chosen
+        # (we can't compare device states across ranks in a single-process context).
+        if self.init_device == "init_on_rank0":
+            if self.rank == 0:
+                logger.info("init_on_rank0 detected: preparing model for sharding then scattering weights.")
             model = self.prepare_model(model)
             self._sync_module_states(model)
         elif model.device.type == "meta":
