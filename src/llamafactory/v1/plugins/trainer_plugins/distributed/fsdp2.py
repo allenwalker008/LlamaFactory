@@ -212,29 +212,9 @@ class FSDP2Engine:
 
         return model
 
-    def _sync_module_states(self, model: HFModel):
-        """After `prepare_model`, broadcast Rank 0's full weights to all shards using PyTorch DCP APIs.
-        `get_model_state_dict(full_state_dict=True)` gathers from all ranks to Rank 0 CPU, then
-        `set_model_state_dict(full_state_dict=True)` scatters them back into local DTensor shards on each rank.
-        This avoids storing the full model twice on Rank 1+ devices.
-        """
-        from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict, StateDictOptions
-
-        if self.rank == 0:
-            logger.info("Scattering Rank 0 weights into FSDP2 local shards via state dict...")
-
-        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        # Gather full state dict from Rank 0 (the only rank that actually has real data at this point)
-        full_state_dict = get_model_state_dict(model, options=options)
-        # Scatter: set_model_state_dict with full_state_dict will automatically distribute
-        # the tensors into the local DTensor shards of each participating rank
-        set_model_state_dict(model, full_state_dict, options=options)
-
-        if self.rank == 0:
-            logger.info("State dict scatter complete.")
-
     def shard_model(self, model: HFModel) -> HFModel:
         import torch.distributed as dist
+        from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
         # Detect init_on_rank0 purely from runtime state:
         # Rank 0 broadcasts whether its own params are on CPU (not Meta).
@@ -245,8 +225,23 @@ class FSDP2Engine:
         if rank0_is_cpu[0]:
             if self.rank == 0:
                 logger.info("init_on_rank0 detected: sharding then scattering Rank 0 CPU weights.")
+                # Capture the full state dict BEFORE fully_shard converts params to DTensors.
+                # model.state_dict() on a plain CPU nn.Module is a simple dict, no collective ops needed.
+                full_sd = {k: v.clone() for k, v in model.state_dict().items()}
+            else:
+                full_sd = {}
+
             model = self.prepare_model(model)
-            self._sync_module_states(model)
+
+            # Materialize all params to empty device tensors (Rank 1+ Meta → empty device)
+            device = get_current_accelerator()
+            model.to_empty(device=device)
+
+            # Scatter: Rank 0 broadcasts each tensor from full_sd into everyone's DTensor shards.
+            # broadcast_from_rank0=True handles the Rank0→all distribution without AllGather.
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
+            set_model_state_dict(model, full_sd, options=options)
+
         elif model.device.type == "meta":
             model = self.prepare_model(model)
             model = self.materialize_and_load(model, hf_model_path=model.config.name_or_path, dcp_path=self.dcp_path)
