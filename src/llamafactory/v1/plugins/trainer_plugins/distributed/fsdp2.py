@@ -248,10 +248,8 @@ class FSDP2Engine:
         import torch.distributed as dist
         from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
-        # Detect init_on_rank0 purely from runtime state:
-        # Rank 0 broadcasts whether its own params are on CPU (not Meta).
-        # If yes, all Rank 1+ must have Meta shells → this is the init_on_rank0 scenario.
-        rank0_is_cpu = [not any(p.device.type == "meta" for p in model.parameters()) and any(p.device.type == "cpu" for p in model.parameters())]
+        # Checks if Rank 0 loaded the model on CPU
+        rank0_is_cpu = [model.device.type == "cpu" if self.rank == 0 else False]
         dist.broadcast_object_list(rank0_is_cpu, src=0, group=self.fsdp_mesh.get_group())
 
         if rank0_is_cpu[0]:
