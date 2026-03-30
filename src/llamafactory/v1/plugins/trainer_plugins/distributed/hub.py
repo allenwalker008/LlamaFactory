@@ -59,3 +59,17 @@ def save_model_deepspeed(model: HFModel, output_dir: str, processor: Processor) 
     from .deepspeed import save_model
 
     return save_model(model, output_dir, processor)
+
+
+@DistributedPlugin("mindspeed").register()
+def shard_model_mindspeed(model: HFModel, dist_config: PluginConfig, **kwargs) -> HFModel:
+    from .mindspeed import MindSpeedEngine
+
+    return MindSpeedEngine(dist_config).shard_model(model)
+
+
+@DistributedPlugin("mindspeed").register("save_model")
+def save_model_mindspeed(model: HFModel, output_dir: str, processor: Processor) -> None:
+    from .mindspeed import save_model
+
+    return save_model(model, output_dir, processor)

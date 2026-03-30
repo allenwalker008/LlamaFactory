@@ -313,7 +313,7 @@ class BaseTrainer:
 
     def save_model(self) -> None:
         """Save the model."""
-        if self.args.dist_config is not None and self.args.dist_config.name in ("deepspeed", "fsdp2"):
+        if self.args.dist_config is not None and self.args.dist_config.name in ("deepspeed", "fsdp2", "mindspeed"):
             from ..plugins.trainer_plugins.distributed.hub import DistributedPlugin
 
             DistributedPlugin(self.args.dist_config.name).save_model(
